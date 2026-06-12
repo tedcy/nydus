@@ -8,9 +8,9 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 
 /// Result of a singleflight call.
 #[derive(Clone, Debug)]
@@ -55,6 +55,23 @@ struct ResultWrapper<T: Clone, E: Clone>(Result<T, E>);
 enum CallState {
     /// A call is currently in progress; wait on the receiver.
     InFlight(watch::Receiver<Option<Result<BoxedResult, String>>>),
+}
+
+struct InFlightGuard {
+    calls: Arc<Mutex<HashMap<String, CallState>>>,
+    key: String,
+    rx: watch::Receiver<Option<Result<BoxedResult, String>>>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut calls = self.calls.lock().expect("Not expect poisoned lock");
+        if let Some(CallState::InFlight(current)) = calls.get(&self.key) {
+            if current.same_channel(&self.rx) {
+                calls.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Singleflight group that manages in-flight calls.
@@ -105,12 +122,15 @@ impl Group {
     {
         let key = key.to_string();
 
-        let mut calls = self.calls.lock().await;
-
-        // Check after acquiring lock.
-        if let Some(CallState::InFlight(rx)) = calls.get(&key) {
-            let rx = rx.clone();
-            drop(calls);
+        let in_flight_rx = {
+            let calls = self.calls.lock().expect("Not expect poisoned lock");
+            if let Some(CallState::InFlight(rx)) = calls.get(&key) {
+                Some(rx.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(rx) = in_flight_rx {
             return Self::wait_for_result::<T, E>(rx)
                 .await
                 .map(|value| CallResult {
@@ -121,8 +141,15 @@ impl Group {
 
         // We are the one to perform the call.
         let (tx, rx) = watch::channel(None);
-        calls.insert(key.clone(), CallState::InFlight(rx));
-        drop(calls);
+        {
+            let mut calls = self.calls.lock().expect("Not expect poisoned lock");
+            calls.insert(key.clone(), CallState::InFlight(rx.clone()));
+        }
+        let _guard = InFlightGuard {
+            calls: Arc::clone(&self.calls),
+            key: key.clone(),
+            rx,
+        };
 
         // Execute the function.
         let result = func().await;
@@ -131,14 +158,7 @@ impl Group {
         let wrapper = Arc::new(ResultWrapper(result.clone())) as BoxedResult;
         let send_result: Result<BoxedResult, String> = Ok(wrapper);
 
-        // Notify all waiting tasks.
         let _ = tx.send(Some(send_result));
-
-        // Update state and remove the in-flight entry.
-        {
-            let mut calls = self.calls.lock().await;
-            calls.remove(&key);
-        }
 
         result
             .map(|value| CallResult {
@@ -203,7 +223,7 @@ impl Group {
     ///
     /// This is useful when you want to force a refresh.
     pub async fn forget(&self, key: &str) {
-        let mut calls = self.calls.lock().await;
+        let mut calls = self.calls.lock().expect("Not expect poisoned lock");
         calls.remove(key);
     }
 }
@@ -406,6 +426,49 @@ mod tests {
         assert!(!call_result2.shared);
 
         // Both calls should have executed.
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_leader_does_not_poison_key() {
+        // Reproduce the cancellation shape: the first caller becomes leader,
+        // enters func(), and is then dropped while waiting. The next call with
+        // the same key must not observe a stale InFlight entry.
+        let group = Arc::new(Group::new());
+        let call_count = Arc::new(AtomicU64::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+
+        let group_for_leader = group.clone();
+        let count = call_count.clone();
+        let leader = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                group_for_leader.do_call("cancel_key", || async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    // Make sure the leader has entered func() before timeout fires.
+                    let _ = entered_tx.send(());
+                    // Keep the leader pending so timeout drops the do_call future.
+                    std::future::pending::<Result<String, String>>().await
+                }),
+            )
+            .await
+        });
+
+        entered_rx.await.expect("leader should enter func");
+        assert!(leader.await.unwrap().is_err(), "leader should time out");
+
+        let count = call_count.clone();
+        // Retry the same key; it should become a fresh leader.
+        let result: Result<CallResult<String>, SingleflightError<String>> = group
+            .do_call("cancel_key", || async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok("recovered".to_string())
+            })
+            .await;
+
+        let call_result = result.expect("stale in-flight call should be retried");
+        assert_eq!(call_result.value, "recovered");
+        assert!(!call_result.shared);
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
     }
 
